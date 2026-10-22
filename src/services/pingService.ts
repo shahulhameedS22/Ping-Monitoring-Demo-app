@@ -14,7 +14,7 @@ import {
 } from '../types/ping';
 import {
   executeRealRegionalPing,
-  areRealRegionalApisConfigured,
+  getRegionalEndpoints,
   isValidIpv4,
   isValidPingCount,
 } from './regionalApi';
@@ -37,7 +37,7 @@ export function calculateSessionSummary(
   const list = Object.values(regions);
   const totalRegions = list.length;
 
-  const testedList = list.filter(r => r.status !== 'Not Tested');
+  const testedList = list.filter(r => r.status !== 'Not Tested' && r.status !== 'Running');
   if (testedList.length === 0) {
     return {
       totalRegions: 4,
@@ -57,15 +57,15 @@ export function calculateSessionSummary(
   ).length;
 
   const validAverages = testedList
-    .filter(r => r.avgLatencyMs !== null)
+    .filter(r => r.avgLatencyMs !== null && typeof r.avgLatencyMs === 'number')
     .map(r => r.avgLatencyMs as number);
 
   const validMins = testedList
-    .filter(r => r.minLatencyMs !== null)
+    .filter(r => r.minLatencyMs !== null && typeof r.minLatencyMs === 'number')
     .map(r => r.minLatencyMs as number);
 
   const validMaxs = testedList
-    .filter(r => r.maxLatencyMs !== null)
+    .filter(r => r.maxLatencyMs !== null && typeof r.maxLatencyMs === 'number')
     .map(r => r.maxLatencyMs as number);
 
   const overallAvgLatencyMs = validAverages.length > 0
@@ -120,7 +120,8 @@ export function createInitialRegionalResults(targetIp: string = '8.8.8.8'): Reco
 
 /**
  * Executes a full ping test session across all 4 regional DCs concurrently using authorized APIs.
- * Throws a clear descriptive error if regional endpoints are not configured.
+ * Runs 30 pings to 8.8.8.8.
+ * Isolates regional errors without generating fake fallback results.
  */
 export async function executePingSession(
   options: ExecuteSessionOptions
@@ -135,19 +136,12 @@ export async function executePingSession(
     throw new Error(`Ping count must be between 1 and 100. Received: ${pingCount}`);
   }
 
-  // Check if real regional APIs are configured
-  if (!areRealRegionalApisConfigured()) {
-    throw new Error(
-      'Regional ping APIs are not configured yet. Connect the authorized regional servers to run real tests.'
-    );
-  }
-
   const sessionId = `sess_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
   const startedAt = new Date().toISOString();
   const token = options.getUserToken ? await options.getUserToken() : '';
   const regionIds: RegionId[] = ['IN-DC01', 'IN-DC02', 'LK-DC01', 'SG-DC01'];
 
-  // Mark all regions as Running
+  // 1. Mark all 4 regions as Running immediately
   const initialRegions = createInitialRegionalResults(targetIp);
   for (const rid of regionIds) {
     initialRegions[rid].status = 'Running';
@@ -155,7 +149,7 @@ export async function executePingSession(
     options.onRegionProgress?.(rid, initialRegions[rid]);
   }
 
-  // Execute concurrently across real regional endpoints with isolated failure handling
+  // 2. Execute concurrently across real regional endpoints
   const settled = await Promise.allSettled(
     regionIds.map(rid =>
       executeRealRegionalPing(
@@ -170,20 +164,25 @@ export async function executePingSession(
     )
   );
 
+  // 3. Process settled results strictly from server responses
   const finalRegions = createInitialRegionalResults(targetIp);
+
   settled.forEach((res, index) => {
     const rid = regionIds[index];
     if (res.status === 'fulfilled') {
       finalRegions[rid] = res.value;
     } else {
+      const errorMsg = res.reason?.message || 'Regional endpoint connection failure';
+      const isMissingConfig = errorMsg.includes('not configured');
+
       finalRegions[rid] = {
         regionId: rid,
         regionName: `${rid} — ${REGIONS[rid].fullName}`,
         targetIp,
-        status: 'Failed',
-        requestsSent: pingCount,
+        status: isMissingConfig ? 'Unavailable' : 'Failed',
+        requestsSent: 0,
         successfulReplies: 0,
-        failedRequests: pingCount,
+        failedRequests: 0,
         packetLossPercent: 100,
         minLatencyMs: null,
         avgLatencyMs: null,
@@ -192,7 +191,7 @@ export async function executePingSession(
         durationMs: null,
         startedAt,
         completedAt: new Date().toISOString(),
-        errorDetails: res.reason?.message || 'Regional endpoint connection failure',
+        errorDetails: errorMsg,
         packets: [],
       };
     }
@@ -203,9 +202,9 @@ export async function executePingSession(
   const summary = calculateSessionSummary(finalRegions);
 
   let sessionStatus: 'success' | 'partial_loss' | 'failed' = 'success';
-  if ((summary.failedOrUnavailableRegions ?? 0) > 0 && (summary.successfulRegions ?? 0) === 0) {
+  if ((summary.failedOrUnavailableRegions ?? 0) === 4) {
     sessionStatus = 'failed';
-  } else if ((summary.partialLossRegions ?? 0) > 0 || (summary.failedOrUnavailableRegions ?? 0) > 0) {
+  } else if ((summary.failedOrUnavailableRegions ?? 0) > 0 || (summary.partialLossRegions ?? 0) > 0) {
     sessionStatus = 'partial_loss';
   }
 

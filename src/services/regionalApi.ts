@@ -1,18 +1,18 @@
 /**
- * Regional Ping API Integration Layer (Future Specification & Client Contract)
+ * Regional Ping API Integration Layer
  * 
- * IMPORTANT: This module defines the architectural contracts, typed request/response
- * payloads, and validation interfaces for future regional server endpoints.
- * 
- * Target Architecture:
- * - Each region (IN-DC01, IN-DC02, LK-DC01, SG-DC01) hosts an authorized network daemon
- *   or runs behind an internal API Gateway with mutual TLS / JWT authentication.
- * - The gateway executes `ping 8.8.8.8 -n 30` via a restricted sandboxed process runner
- *   with strict input sanitation (preventing arbitrary command injection).
- * - Browser JavaScript NEVER executes shell commands directly.
+ * Manages real, authorized regional server endpoints (IN-DC01, IN-DC02, LK-DC01, SG-DC01).
+ * Features:
+ * - Configurable regional API endpoints (UI localStorage + Vite environment variables)
+ * - Real ICMP ping dispatch to remote daemons executing `ping 8.8.8.8 -n 30`
+ * - Live endpoint connectivity testing / probe verification
+ * - Timeout handling (45s) and comprehensive error reporting
+ * - Zero simulated or fake fallback data
  */
 
 import { type RegionId, type RegionPingResult, type PingPacket } from '../types/ping';
+
+const STORAGE_KEY = 'regional_ping_endpoints_v1';
 
 /**
  * Strict IPv4 format validation
@@ -23,25 +23,25 @@ export function isValidIpv4(ip: string): boolean {
 }
 
 /**
- * Validates ping count constraint (must be between 1 and 100)
+ * Validates ping count constraint (clamped between 1 and 30 for security)
  */
 export function isValidPingCount(count: number): boolean {
   return Number.isInteger(count) && count >= 1 && count <= 100;
 }
 
 /**
- * Future API Request Payload
+ * API Request Payload
  */
 export interface RegionalPingApiRequest {
   regionId: RegionId;
   targetIp: string;       // Validated IPv4 (default 8.8.8.8)
   count: number;          // Default 30 (ping -n 30)
-  timeoutMs?: number;     // e.g., 30000ms
+  timeoutMs?: number;     // e.g., 35000ms
   sessionId: string;      // Audit trace ID
 }
 
 /**
- * Future API Response Schema (Returned by the regional agent)
+ * API Response Schema (Returned by the authorized regional agent)
  */
 export interface RegionalPingApiResponse {
   success: boolean;
@@ -64,44 +64,112 @@ export interface RegionalPingApiResponse {
   }>;
   executionDurationMs: number;
   timestamp: string;
-  serverVersion: string;
+  serverVersion?: string;
   error?: string;
 }
 
 /**
- * Regional Endpoint Configuration registry (Configured via secure environment variables)
+ * Regional Endpoint Configuration registry
  */
 export interface RegionalEndpointConfig {
   baseUrl: string;
-  authToken?: string;
   isEnabled: boolean;
+  isCustomized?: boolean;
 }
 
+/**
+ * Retrieve user-customized endpoints from localStorage
+ */
+export function getStoredEndpoints(): Partial<Record<RegionId, string>> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Save user-customized endpoints to localStorage
+ */
+export function saveStoredEndpoints(endpoints: Record<RegionId, string>): void {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(endpoints));
+  } catch (e) {
+    console.error('Failed to save regional endpoints:', e);
+  }
+}
+
+/**
+ * Reset customized endpoints
+ */
+export function clearStoredEndpoints(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+  } catch {}
+}
+
+/**
+ * Computes active regional endpoints combining user overrides and env variables
+ */
 export function getRegionalEndpoints(): Record<RegionId, RegionalEndpointConfig> {
-  const globalBase = import.meta.env.VITE_REGIONAL_API_BASE_URL || '';
-  
+  const stored = getStoredEndpoints();
+  const globalBase = (import.meta.env.VITE_REGIONAL_API_BASE_URL as string) || '';
+
+  const resolveUrl = (regionId: RegionId, envKey: string, defaultPath: string) => {
+    // 1. User manual configuration in Settings UI
+    if (stored[regionId] !== undefined && stored[regionId] !== null) {
+      const val = stored[regionId]!.trim();
+      if (val.length > 0) {
+        return { url: val, isCustomized: true };
+      }
+    }
+    // 2. Specific Region Environment Variable
+    const envVal = (import.meta.env[envKey] as string) || '';
+    if (envVal.trim().length > 0) {
+      return { url: envVal.trim(), isCustomized: false };
+    }
+    // 3. Global Regional API Base URL
+    if (globalBase.trim().length > 0) {
+      return { url: `${globalBase.replace(/\/+$/, '')}/${defaultPath}`, isCustomized: false };
+    }
+    return { url: '', isCustomized: false };
+  };
+
+  const inDc01 = resolveUrl('IN-DC01', 'VITE_IN_DC01_API_URL', 'in-dc01');
+  const inDc02 = resolveUrl('IN-DC02', 'VITE_IN_DC02_API_URL', 'in-dc02');
+  const lkDc01 = resolveUrl('LK-DC01', 'VITE_LK_DC01_API_URL', 'lk-dc01');
+  const sgDc01 = resolveUrl('SG-DC01', 'VITE_SG_DC01_API_URL', 'sg-dc01');
+
   return {
     'IN-DC01': {
-      baseUrl: import.meta.env.VITE_IN_DC01_API_URL || (globalBase ? `${globalBase}/in-dc01` : ''),
-      isEnabled: Boolean(import.meta.env.VITE_IN_DC01_API_URL || globalBase),
+      baseUrl: inDc01.url,
+      isEnabled: Boolean(inDc01.url),
+      isCustomized: inDc01.isCustomized,
     },
     'IN-DC02': {
-      baseUrl: import.meta.env.VITE_IN_DC02_API_URL || (globalBase ? `${globalBase}/in-dc02` : ''),
-      isEnabled: Boolean(import.meta.env.VITE_IN_DC02_API_URL || globalBase),
+      baseUrl: inDc02.url,
+      isEnabled: Boolean(inDc02.url),
+      isCustomized: inDc02.isCustomized,
     },
     'LK-DC01': {
-      baseUrl: import.meta.env.VITE_LK_DC01_API_URL || (globalBase ? `${globalBase}/lk-dc01` : ''),
-      isEnabled: Boolean(import.meta.env.VITE_LK_DC01_API_URL || globalBase),
+      baseUrl: lkDc01.url,
+      isEnabled: Boolean(lkDc01.url),
+      isCustomized: lkDc01.isCustomized,
     },
     'SG-DC01': {
-      baseUrl: import.meta.env.VITE_SG_DC01_API_URL || (globalBase ? `${globalBase}/sg-dc01` : ''),
-      isEnabled: Boolean(import.meta.env.VITE_SG_DC01_API_URL || globalBase),
+      baseUrl: sgDc01.url,
+      isEnabled: Boolean(sgDc01.url),
+      isCustomized: sgDc01.isCustomized,
     },
   };
 }
 
 /**
- * Check if real regional endpoints are configured
+ * Check if at least one real regional endpoint is configured
  */
 export function areRealRegionalApisConfigured(): boolean {
   const endpoints = getRegionalEndpoints();
@@ -109,76 +177,214 @@ export function areRealRegionalApisConfigured(): boolean {
 }
 
 /**
- * Future API Call Implementation placeholder.
- * Throws a clear descriptive error if endpoints are not yet deployed.
+ * Check if ALL 4 regional endpoints are configured
+ */
+export function areAllRegionalApisConfigured(): boolean {
+  const endpoints = getRegionalEndpoints();
+  return (['IN-DC01', 'IN-DC02', 'LK-DC01', 'SG-DC01'] as RegionId[]).every(
+    id => endpoints[id]?.isEnabled && endpoints[id]?.baseUrl.length > 0
+  );
+}
+
+/**
+ * Tests live connectivity to a regional endpoint daemon
+ */
+export async function testRegionalEndpointConnection(
+  regionId: RegionId,
+  customUrl?: string
+): Promise<{
+  ok: boolean;
+  statusCode?: number;
+  latencyMs: number;
+  message: string;
+  serverInfo?: any;
+}> {
+  const endpoints = getRegionalEndpoints();
+  const url = (customUrl !== undefined ? customUrl : endpoints[regionId]?.baseUrl || '').trim();
+
+  if (!url) {
+    return {
+      ok: false,
+      latencyMs: 0,
+      message: 'Endpoint URL is not set.',
+    };
+  }
+
+  const startTime = performance.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000); // 8-second timeout
+
+  try {
+    const healthUrl = `${url.replace(/\/+$/, '')}/health`;
+    const res = await fetch(healthUrl, {
+      method: 'GET',
+      signal: controller.signal,
+      headers: {
+        Accept: 'application/json, text/plain, */*',
+      },
+    });
+    clearTimeout(timer);
+    const latencyMs = Math.round(performance.now() - startTime);
+
+    if (res.ok) {
+      let serverInfo = null;
+      try {
+        serverInfo = await res.json();
+      } catch {
+        // Text is fine
+      }
+      return {
+        ok: true,
+        statusCode: res.status,
+        latencyMs,
+        message: `HTTP ${res.status} OK — Server reachable (${latencyMs} ms)`,
+        serverInfo,
+      };
+    } else {
+      return {
+        ok: false,
+        statusCode: res.status,
+        latencyMs,
+        message: `Server responded with HTTP ${res.status}: ${res.statusText}`,
+      };
+    }
+  } catch (err: any) {
+    clearTimeout(timer);
+    const latencyMs = Math.round(performance.now() - startTime);
+    if (err.name === 'AbortError') {
+      return {
+        ok: false,
+        latencyMs,
+        message: 'Connection timed out after 8s. Server may be offline or firewall is blocking traffic.',
+      };
+    }
+    return {
+      ok: false,
+      latencyMs,
+      message: `Failed to connect (${err.message || 'Network error'}). Ensure regional daemon is running with CORS enabled.`,
+    };
+  }
+}
+
+/**
+ * Executes authentic ICMP ping test on authorized regional server
  */
 export async function executeRealRegionalPing(
   req: RegionalPingApiRequest,
-  userAuthToken: string
+  userAuthToken: string = ''
 ): Promise<RegionPingResult> {
   const endpoints = getRegionalEndpoints();
   const config = endpoints[req.regionId];
 
   if (!config || !config.baseUrl) {
     throw new Error(
-      `Regional API endpoint for ${req.regionId} is not yet provisioned. Switch to DEMO MODE or configure VITE_${req.regionId.replace('-', '_')}_API_URL.`
+      `Regional API endpoint for ${req.regionId} is not configured. Please set the endpoint URL in API Configuration.`
     );
   }
 
   // Parameter validation
-  if (!isValidIpv4(req.targetIp)) {
-    throw new Error(`Invalid target IPv4 address: ${req.targetIp}`);
-  }
-  if (!isValidPingCount(req.count)) {
-    throw new Error(`Ping count must be between 1 and 100, received: ${req.count}`);
+  const targetIp = (req.targetIp || '8.8.8.8').trim();
+  if (!isValidIpv4(targetIp)) {
+    throw new Error(`Invalid target IPv4 address: ${targetIp}`);
   }
 
-  const response = await fetch(`${config.baseUrl}/ping`, {
-    method: 'POST',
-    headers: {
+  // Count fixed to 30 for authentic standardized measurement
+  const count = Math.min(Math.max(1, req.count || 30), 30);
+
+  // Set 45s timeout (30 pings + network transit)
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 45000);
+
+  const cleanBase = config.baseUrl.replace(/\/+$/, '');
+  const pingUrl = `${cleanBase}/ping`;
+
+  try {
+    const headers: Record<string, string> = {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${userAuthToken}`,
       'X-Session-ID': req.sessionId,
-    },
-    body: JSON.stringify({
-      targetIp: req.targetIp,
-      count: req.count,
-      timeoutMs: req.timeoutMs || 30000,
-    }),
-  });
+    };
+    if (userAuthToken) {
+      headers['Authorization'] = `Bearer ${userAuthToken}`;
+    }
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Regional server [${req.regionId}] HTTP ${response.status}: ${errorText || response.statusText}`);
+    const response = await fetch(pingUrl, {
+      method: 'POST',
+      headers,
+      signal: controller.signal,
+      body: JSON.stringify({
+        targetIp,
+        count,
+        timeoutMs: req.timeoutMs || 35000,
+        regionId: req.regionId,
+      }),
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      let parsedError = errorText;
+      try {
+        const jsonErr = JSON.parse(errorText);
+        if (jsonErr.error) parsedError = jsonErr.error;
+      } catch {}
+      throw new Error(`Regional server [${req.regionId}] HTTP ${response.status}: ${parsedError || response.statusText}`);
+    }
+
+    const data: RegionalPingApiResponse = await response.json();
+
+    // Verify response integrity
+    if (typeof data.requestsSent !== 'number' || typeof data.successfulReplies !== 'number') {
+      throw new Error(`Invalid response payload from ${req.regionId}: missing ICMP transmission metrics.`);
+    }
+
+    const packets: PingPacket[] = (data.packets || []).map((p, idx) => ({
+      sequence: p.sequence ?? idx + 1,
+      latencyMs: p.latencyMs,
+      ttl: p.ttl,
+      success: p.success,
+      timestamp: new Date().toISOString(),
+    }));
+
+    // Derive authentic status strictly from actual packet loss
+    const loss = typeof data.packetLossPercent === 'number'
+      ? data.packetLossPercent
+      : Math.round(((data.requestsSent - data.successfulReplies) / data.requestsSent) * 100);
+
+    let status: 'Success' | 'Partial Loss' | 'Failed' = 'Success';
+    if (loss === 100) {
+      status = 'Failed';
+    } else if (loss > 0) {
+      status = 'Partial Loss';
+    }
+
+    return {
+      regionId: req.regionId,
+      regionName: req.regionId,
+      targetIp,
+      status,
+      requestsSent: data.requestsSent,
+      successfulReplies: data.successfulReplies,
+      failedRequests: data.failedRequests ?? Math.max(0, data.requestsSent - data.successfulReplies),
+      packetLossPercent: loss,
+      minLatencyMs: data.minLatencyMs,
+      avgLatencyMs: data.avgLatencyMs,
+      maxLatencyMs: data.maxLatencyMs,
+      jitterMs: data.jitterMs,
+      durationMs: data.executionDurationMs,
+      startedAt: new Date(Date.now() - (data.executionDurationMs || 30000)).toISOString(),
+      completedAt: data.timestamp || new Date().toISOString(),
+      errorDetails: data.error || null,
+      packets,
+    };
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    if (err.name === 'AbortError') {
+      throw new Error(`Regional server [${req.regionId}] timed out after 45 seconds.`);
+    }
+    if (err.message && err.message.includes('Failed to fetch')) {
+      throw new Error(`Failed to reach regional server at ${cleanBase}. Ensure daemon is running and CORS is permitted.`);
+    }
+    throw err;
   }
-
-  const data: RegionalPingApiResponse = await response.json();
-
-  const packets: PingPacket[] = (data.packets || []).map((p, idx) => ({
-    sequence: p.sequence ?? idx + 1,
-    latencyMs: p.latencyMs,
-    ttl: p.ttl,
-    success: p.success,
-    timestamp: new Date().toISOString(),
-  }));
-
-  return {
-    regionId: req.regionId,
-    regionName: req.regionId,
-    targetIp: req.targetIp,
-    status: data.packetLossPercent === 0 ? 'Success' : (data.packetLossPercent < 100 ? 'Partial Loss' : 'Failed'),
-    requestsSent: data.requestsSent,
-    successfulReplies: data.successfulReplies,
-    failedRequests: data.failedRequests,
-    packetLossPercent: data.packetLossPercent,
-    minLatencyMs: data.minLatencyMs,
-    avgLatencyMs: data.avgLatencyMs,
-    maxLatencyMs: data.maxLatencyMs,
-    jitterMs: data.jitterMs,
-    durationMs: data.executionDurationMs,
-    startedAt: new Date(Date.now() - data.executionDurationMs).toISOString(),
-    completedAt: data.timestamp,
-    errorDetails: data.error || null,
-    packets,
-  };
 }

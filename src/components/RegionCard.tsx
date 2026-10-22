@@ -10,6 +10,7 @@ import {
   Clock,
   Server,
   Loader2,
+  AlertCircle,
 } from 'lucide-react';
 
 interface RegionCardProps {
@@ -150,6 +151,18 @@ export const RegionCard: React.FC<RegionCardProps> = ({
             </div>
           </div>
         </div>
+
+        {/* Diagnostic error banner if failed or unavailable */}
+        {result.errorDetails && (
+          <div
+            onClick={() => onInspectPackets?.(result)}
+            className="mt-3.5 p-2 bg-[#FDECEC] border border-[#FCA5A5] rounded-lg text-[11px] text-[#D93652] flex items-start gap-1.5 cursor-pointer hover:bg-[#FCD8D8] transition-colors"
+            title="Click to view detailed diagnostic output"
+          >
+            <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#D93652]" />
+            <span className="truncate font-medium">{result.errorDetails}</span>
+          </div>
+        )}
 
         {/* Test Duration Footer Row */}
         <div className="mt-4 pt-2.5 border-t border-[#EFF5FC] flex items-center justify-between text-[11px] text-[#607A9B]">

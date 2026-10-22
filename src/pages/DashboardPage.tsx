@@ -59,14 +59,6 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     setApiNotice(null);
     setErrorMessage(null);
 
-    // Verify if real regional endpoints are configured
-    if (!areRealRegionalApisConfigured()) {
-      setApiNotice(
-        'Regional ping APIs are not configured yet. Connect the authorized regional servers to run real tests.'
-      );
-      return;
-    }
-
     isExecutingRef.current = true;
     setIsRunning(true);
 
@@ -86,10 +78,39 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       setLastSession(session);
       setRegionalResults(session.regions);
 
-      try {
-        await savePingSession(session);
-      } catch (dbErr: any) {
-        console.warn('Could not save session to Firestore:', dbErr);
+      // Check if all endpoints were missing or if some failed
+      const unconfiguredRegions = Object.values(session.regions).filter(
+        r => r.status === 'Unavailable' || (r.errorDetails && r.errorDetails.includes('not configured'))
+      );
+      const failedRegions = Object.values(session.regions).filter(
+        r => r.status === 'Failed'
+      );
+
+      if (unconfiguredRegions.length === 4) {
+        setApiNotice(
+          'Regional ping APIs are not configured yet. Connect the authorized regional servers in API Configuration to run real tests.'
+        );
+      } else if (unconfiguredRegions.length > 0 || failedRegions.length > 0) {
+        const issues: string[] = [];
+        if (unconfiguredRegions.length > 0) {
+          issues.push(`${unconfiguredRegions.length} region(s) missing endpoint`);
+        }
+        if (failedRegions.length > 0) {
+          issues.push(`${failedRegions.length} region(s) unreachable or failed`);
+        }
+        setErrorMessage(`Ping test completed with notices: ${issues.join(', ')}. Inspect regional cards for details.`);
+      }
+
+      // Save to Firestore only if at least one region succeeded
+      const hasRealSuccess = Object.values(session.regions).some(
+        r => r.status === 'Success' || r.status === 'Partial Loss'
+      );
+      if (hasRealSuccess) {
+        try {
+          await savePingSession(session);
+        } catch (dbErr: any) {
+          console.warn('Could not save session to Firestore:', dbErr);
+        }
       }
     } catch (err: any) {
       setErrorMessage(err?.message || 'Failed to complete regional ping session.');
