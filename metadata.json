@@ -1,0 +1,6 @@
+{
+  "name": "Regional Ping Monitor",
+  "description": "Enterprise network connectivity monitoring dashboard for regional data centers (IN-DC01, IN-DC02, LK-DC01, SG-DC01) with concurrent ping testing and Cloud Firestore session history.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

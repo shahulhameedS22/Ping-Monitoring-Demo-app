@@ -1,0 +1,67 @@
+{
+  "entities": {
+    "PingSession": {
+      "title": "PingSession",
+      "description": "Stores regional ping test execution session, aggregate results, and individual data center metrics",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique session identifier"
+        },
+        "targetIp": {
+          "type": "string",
+          "description": "Target IP address (default 8.8.8.8)"
+        },
+        "pingCount": {
+          "type": "number",
+          "description": "Number of ping requests per region (e.g. 30)"
+        },
+        "status": {
+          "type": "string",
+          "description": "Overall session status: running, success, partial_loss, failed"
+        },
+        "isSimulated": {
+          "type": "boolean",
+          "description": "Flag indicating if the session ran in demo/simulation mode"
+        },
+        "startedAt": {
+          "type": "string",
+          "description": "ISO timestamp of session start"
+        },
+        "completedAt": {
+          "type": "string",
+          "description": "ISO timestamp of session completion"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Firestore server timestamp or creation ISO string"
+        },
+        "summary": {
+          "type": "object",
+          "description": "Aggregate statistics across all tested regions"
+        },
+        "regions": {
+          "type": "object",
+          "description": "Keyed map of regional results: IN-DC01, IN-DC02, LK-DC01, SG-DC01"
+        }
+      },
+      "required": [
+        "id",
+        "targetIp",
+        "pingCount",
+        "status",
+        "isSimulated",
+        "startedAt",
+        "summary",
+        "regions"
+      ]
+    }
+  },
+  "firestore": {
+    "/pingSessions/{sessionId}": {
+      "schema": "PingSession",
+      "description": "Stores regional ping test execution session, aggregate results, and individual data center metrics"
+    }
+  }
+}
