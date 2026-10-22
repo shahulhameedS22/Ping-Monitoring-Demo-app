@@ -62,6 +62,15 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     isExecutingRef.current = true;
     setIsRunning(true);
 
+    // Immediately flip all 4 regional cards to 'Running' in UI
+    const runStartTime = new Date().toISOString();
+    setRegionalResults(prev => ({
+      'IN-DC01': { ...prev['IN-DC01'], status: 'Running', startedAt: runStartTime, errorDetails: null },
+      'IN-DC02': { ...prev['IN-DC02'], status: 'Running', startedAt: runStartTime, errorDetails: null },
+      'LK-DC01': { ...prev['LK-DC01'], status: 'Running', startedAt: runStartTime, errorDetails: null },
+      'SG-DC01': { ...prev['SG-DC01'], status: 'Running', startedAt: runStartTime, errorDetails: null },
+    }));
+
     try {
       const session = await executePingSession({
         userId: 'operator',

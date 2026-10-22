@@ -166,7 +166,7 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
                     className="hover:bg-[#F8FAFD] transition-colors"
                   >
                     <td className="py-3.5 px-4 font-bold text-[#17365D]">
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2.5">
                         <span
                           className={`w-7 h-7 rounded-full border flex items-center justify-center shrink-0 font-bold text-xs select-none ${
                             (COUNTRY_CODES[res.regionId] || 'IN') === 'IN'
@@ -175,6 +175,7 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
                               ? 'bg-[#F0FDFA] text-[#0D9488] border-[#CCFBF1]'
                               : 'bg-[#EEF2FF] text-[#4F46E5] border-[#E0E7FF]'
                           }`}
+                          title={REGIONS[res.regionId]?.country}
                         >
                           {COUNTRY_CODES[res.regionId] || 'IN'}
                         </span>

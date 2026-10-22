@@ -70,6 +70,7 @@ export const RegionCard: React.FC<RegionCardProps> = ({
             {/* Circular Container with Country Code: IN / SL / SG */}
             <div
               className={`w-[42px] h-[42px] rounded-full border flex items-center justify-center shrink-0 shadow-2xs font-extrabold text-sm tracking-wide select-none ${countryBadgeClass}`}
+              title={`${meta.country} (${countryCode})`}
             >
               {countryCode}
             </div>

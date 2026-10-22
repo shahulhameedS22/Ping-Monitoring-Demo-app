@@ -99,6 +99,8 @@ export const REGIONS: Record<RegionId, RegionMetadata> = {
     coordinates: '19.0760° N, 72.8777° E',
     provider: 'CtrlS / Equinix MB1',
     accentColor: '#1764E8', // Primary Blue
+    flagUrl: '/flags/in.svg',
+    flagAlt: 'India flag',
   },
   'IN-DC02': {
     id: 'IN-DC02',
@@ -111,6 +113,8 @@ export const REGIONS: Record<RegionId, RegionMetadata> = {
     coordinates: '13.0827° N, 80.2707° E',
     provider: 'AdaniConneX / Sify',
     accentColor: '#0284C7', // Cyan-blue
+    flagUrl: '/flags/in.svg',
+    flagAlt: 'India flag',
   },
   'LK-DC01': {
     id: 'LK-DC01',
@@ -123,6 +127,8 @@ export const REGIONS: Record<RegionId, RegionMetadata> = {
     coordinates: '6.9271° N, 79.8612° E',
     provider: 'SLT-MOBITEL Tier III',
     accentColor: '#0D9488', // Teal
+    flagUrl: '/flags/lk.svg',
+    flagAlt: 'Sri Lanka flag',
   },
   'SG-DC01': {
     id: 'SG-DC01',
@@ -135,5 +141,8 @@ export const REGIONS: Record<RegionId, RegionMetadata> = {
     coordinates: '1.3521° N, 103.8198° E',
     provider: 'Equinix SG2 / Singtel',
     accentColor: '#4F46E5', // Indigo-blue
+    flagUrl: '/flags/sg.svg',
+    flagAlt: 'Singapore flag',
   },
 };
+
