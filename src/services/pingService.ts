@@ -149,54 +149,51 @@ export async function executePingSession(
     options.onRegionProgress?.(rid, initialRegions[rid]);
   }
 
-  // 2. Execute concurrently across real regional endpoints
-  const settled = await Promise.allSettled(
-    regionIds.map(rid =>
-      executeRealRegionalPing(
-        {
+  // 2. Execute concurrently across real regional endpoints with real-time individual progress
+  const finalRegions: Record<RegionId, RegionPingResult> = { ...initialRegions };
+
+  await Promise.all(
+    regionIds.map(async rid => {
+      try {
+        const result = await executeRealRegionalPing(
+          {
+            regionId: rid,
+            targetIp,
+            count: pingCount,
+            sessionId,
+          },
+          token || ''
+        );
+        finalRegions[rid] = result;
+        options.onRegionProgress?.(rid, result);
+      } catch (err: any) {
+        const errorMsg = err?.message || 'Regional endpoint connection failure';
+        const isMissingConfig = errorMsg.includes('not configured');
+
+        const failedResult: RegionPingResult = {
           regionId: rid,
+          regionName: `${rid} — ${REGIONS[rid]?.fullName || rid}`,
           targetIp,
-          count: pingCount,
-          sessionId,
-        },
-        token || ''
-      )
-    )
+          status: isMissingConfig ? 'Unavailable' : 'Failed',
+          requestsSent: 0,
+          successfulReplies: 0,
+          failedRequests: 0,
+          packetLossPercent: 100,
+          minLatencyMs: null,
+          avgLatencyMs: null,
+          maxLatencyMs: null,
+          jitterMs: null,
+          durationMs: null,
+          startedAt,
+          completedAt: new Date().toISOString(),
+          errorDetails: errorMsg,
+          packets: [],
+        };
+        finalRegions[rid] = failedResult;
+        options.onRegionProgress?.(rid, failedResult);
+      }
+    })
   );
-
-  // 3. Process settled results strictly from server responses
-  const finalRegions = createInitialRegionalResults(targetIp);
-
-  settled.forEach((res, index) => {
-    const rid = regionIds[index];
-    if (res.status === 'fulfilled') {
-      finalRegions[rid] = res.value;
-    } else {
-      const errorMsg = res.reason?.message || 'Regional endpoint connection failure';
-      const isMissingConfig = errorMsg.includes('not configured');
-
-      finalRegions[rid] = {
-        regionId: rid,
-        regionName: `${rid} — ${REGIONS[rid].fullName}`,
-        targetIp,
-        status: isMissingConfig ? 'Unavailable' : 'Failed',
-        requestsSent: 0,
-        successfulReplies: 0,
-        failedRequests: 0,
-        packetLossPercent: 100,
-        minLatencyMs: null,
-        avgLatencyMs: null,
-        maxLatencyMs: null,
-        jitterMs: null,
-        durationMs: null,
-        startedAt,
-        completedAt: new Date().toISOString(),
-        errorDetails: errorMsg,
-        packets: [],
-      };
-    }
-    options.onRegionProgress?.(rid, finalRegions[rid]);
-  });
 
   const completedAt = new Date().toISOString();
   const summary = calculateSessionSummary(finalRegions);

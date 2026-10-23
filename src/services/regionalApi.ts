@@ -10,7 +10,7 @@
  * - Zero simulated or fake fallback data
  */
 
-import { type RegionId, type RegionPingResult, type PingPacket } from '../types/ping';
+import { type RegionId, type RegionPingResult, type PingPacket, REGIONS } from '../types/ping';
 
 const STORAGE_KEY = 'regional_ping_endpoints_v1';
 
@@ -210,6 +210,15 @@ export async function testRegionalEndpointConnection(
     };
   }
 
+  // Guard against browser Mixed Content blocks when dashboard is loaded over HTTPS
+  if (typeof window !== 'undefined' && window.location.protocol === 'https:' && url.startsWith('http://')) {
+    return {
+      ok: false,
+      latencyMs: 0,
+      message: 'Mixed Content Restriction: Dashboard is hosted on HTTPS. Regional endpoint must use HTTPS (or SSL reverse proxy).',
+    };
+  }
+
   const startTime = performance.now();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8000); // 8-second timeout
@@ -298,6 +307,11 @@ export async function executeRealRegionalPing(
   const cleanBase = config.baseUrl.replace(/\/+$/, '');
   const pingUrl = `${cleanBase}/ping`;
 
+  // Guard against browser Mixed Content blocks
+  if (typeof window !== 'undefined' && window.location.protocol === 'https:' && cleanBase.startsWith('http://')) {
+    throw new Error(`Mixed Content Blocked: Dashboard is on HTTPS, endpoint for ${req.regionId} must use HTTPS.`);
+  }
+
   try {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -360,7 +374,7 @@ export async function executeRealRegionalPing(
 
     return {
       regionId: req.regionId,
-      regionName: req.regionId,
+      regionName: `${req.regionId} — ${REGIONS[req.regionId]?.fullName || req.regionId}`,
       targetIp,
       status,
       requestsSent: data.requestsSent,
