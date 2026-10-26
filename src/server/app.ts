@@ -84,41 +84,116 @@ function safeCompare(a: string, b: string): boolean {
   return crypto.timingSafeEqual(bufA, bufB);
 }
 
+declare global {
+  namespace Express {
+    interface Request {
+      isApiKeyAuthenticated?: boolean;
+    }
+  }
+}
+
 /**
- * Authentication & Authorization Middleware
+ * Safely extracts client IP address across reverse proxies (e.g. Vercel, Cloud Run).
+ */
+export function getClientIp(req: Request): string {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string') {
+    const firstIp = forwarded.split(',')[0].trim();
+    if (firstIp) return firstIp;
+  }
+  const realIp = req.headers['x-real-ip'];
+  if (typeof realIp === 'string' && realIp.trim()) {
+    return realIp.trim();
+  }
+  return req.socket?.remoteAddress || 'unknown-client';
+}
+
+/**
+ * Validates public browser request origin / Sec-Fetch metadata to protect against
+ * cross-site execution abuse and ping amplification from third-party sites.
+ */
+function validatePublicRequestOrigin(req: Request): { allowed: boolean; reason?: string } {
+  // 1. Check Sec-Fetch-Site (modern browsers include this header)
+  const secFetchSite = req.headers['sec-fetch-site'];
+  if (typeof secFetchSite === 'string' && secFetchSite === 'cross-site') {
+    return {
+      allowed: false,
+      reason: 'Cross-site request rejected: Ping test execution is restricted to the Regional Ping Monitor dashboard.',
+    };
+  }
+
+  // 2. Validate Origin if present
+  const origin = req.headers['origin'];
+  const host = req.headers['host'];
+  if (typeof origin === 'string' && host) {
+    try {
+      const originHost = new URL(origin).host;
+      const isSameHost = originHost === host;
+      const isAllowedHost = isSameHost ||
+        originHost.endsWith('.vercel.app') ||
+        originHost.includes('localhost') ||
+        originHost.includes('127.0.0.1');
+
+      if (!isAllowedHost) {
+        return {
+          allowed: false,
+          reason: `Untrusted origin "${originHost}". Cross-origin ping execution is restricted.`,
+        };
+      }
+    } catch {
+      return { allowed: false, reason: 'Malformed Origin header.' };
+    }
+  }
+
+  return { allowed: true };
+}
+
+/**
+ * In-memory sliding-window rate limit structures.
+ */
+interface PingRateLimitRecord {
+  timestamps: number[];
+  inFlight: number;
+}
+
+const pingRateLimitStore = new Map<string, PingRateLimitRecord>();
+const healthRateLimitStore = new Map<string, number[]>();
+
+function pruneStaleRateLimits(): void {
+  const now = Date.now();
+  // Prune ping records older than 2 minutes
+  for (const [ip, rec] of pingRateLimitStore.entries()) {
+    rec.timestamps = rec.timestamps.filter(t => now - t < 120_000);
+    if (rec.timestamps.length === 0 && rec.inFlight <= 0) {
+      pingRateLimitStore.delete(ip);
+    }
+  }
+  // Prune health records older than 1 minute
+  for (const [ip, timestamps] of healthRateLimitStore.entries()) {
+    const fresh = timestamps.filter(t => now - t < 60_000);
+    if (fresh.length === 0) {
+      healthRateLimitStore.delete(ip);
+    } else {
+      healthRateLimitStore.set(ip, fresh);
+    }
+  }
+}
+
+/**
+ * Dual-tier Authentication Middleware
  * 
- * Rules:
- * - In production (Vercel deployment: process.env.VERCEL === '1' or NODE_ENV === 'production'),
- *   REQUIRE_AUTH defaults to true unless explicitly set to 'false'.
- * - When REQUIRE_AUTH is true:
- *   - CENTRAL_API_KEY must be configured on the server. If missing, responds with 500 error.
- *   - The client must supply an Authorization header (`Bearer <token>`) or `X-API-Key: <token>`.
- *   - The supplied token is strictly validated against CENTRAL_API_KEY using constant-time comparison.
- *   - Arbitrary or generic Bearer tokens are strictly rejected.
- * - When REQUIRE_AUTH is false (e.g. during local development if explicitly disabled):
- *   - Requests proceed without token verification.
+ * 1. If Authorization: Bearer <key> or X-API-Key: <key> is supplied:
+ *    - Validated in constant time against CENTRAL_API_KEY.
+ *    - If valid, req.isApiKeyAuthenticated is set to true (bypasses public rate limits).
+ *    - If invalid, rejected immediately with HTTP 401 Unauthorized.
+ * 2. If NO credentials are provided:
+ *    - If REQUIRE_AUTH=true is explicitly configured (for strict private/internal setups),
+ *      rejects with HTTP 401 Unauthorized.
+ *    - Otherwise (default for public no-login dashboard), allows the request through
+ *      to route-level abuse protection, strict input validation, and rate limiting.
  */
 export function authMiddleware(req: Request, res: Response, next: NextFunction): void {
-  const isProd = process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
-  const requireAuth = process.env.REQUIRE_AUTH !== undefined
-    ? process.env.REQUIRE_AUTH === 'true'
-    : isProd;
-
-  if (!requireAuth) {
-    return next();
-  }
-
   const expectedKey = process.env.CENTRAL_API_KEY?.trim();
-  if (!expectedKey) {
-    res.status(500).json({
-      ok: false,
-      error: 'Server configuration error: Authentication is enabled (REQUIRE_AUTH=true), but CENTRAL_API_KEY is not configured in environment variables.',
-      code: 'AUTH_CONFIG_MISSING',
-      hint: 'Configure the CENTRAL_API_KEY environment variable in your Vercel project settings or .env file.',
-    });
-    return;
-  }
-
   const authHeader = req.headers['authorization'];
   const apiKeyHeader = req.headers['x-api-key'];
 
@@ -129,15 +204,158 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
     providedToken = authHeader.substring(7).trim();
   }
 
-  if (!providedToken || !safeCompare(providedToken, expectedKey)) {
+  // 1. Credentials supplied: validate strictly
+  if (providedToken) {
+    if (!expectedKey) {
+      res.status(500).json({
+        ok: false,
+        error: 'Server configuration error: Authentication credentials were provided, but CENTRAL_API_KEY is not configured in server environment variables.',
+        code: 'AUTH_CONFIG_MISSING',
+      });
+      return;
+    }
+
+    if (!safeCompare(providedToken, expectedKey)) {
+      res.status(401).json({
+        ok: false,
+        error: 'Unauthorized: Invalid authentication credentials.',
+        code: 'UNAUTHORIZED',
+        hint: 'Provided Bearer token or X-API-Key does not match the configured CENTRAL_API_KEY.',
+      });
+      return;
+    }
+
+    req.isApiKeyAuthenticated = true;
+    return next();
+  }
+
+  // 2. No credentials supplied:
+  // If administrator explicitly requested mandatory authentication:
+  if (process.env.REQUIRE_AUTH === 'true') {
     res.status(401).json({
       ok: false,
-      error: 'Unauthorized: Invalid or missing authentication credentials.',
+      error: 'Unauthorized: Authentication is strictly required (REQUIRE_AUTH=true).',
       code: 'UNAUTHORIZED',
-      hint: 'Provide a valid Authorization: Bearer <CENTRAL_API_KEY> or X-API-Key header matching the configured CENTRAL_API_KEY.',
+      hint: 'Provide a valid Authorization: Bearer <CENTRAL_API_KEY> or X-API-Key header, or configure REQUIRE_AUTH=false for public dashboard access.',
     });
     return;
   }
+
+  // Public dashboard access: proceed to public abuse controls and rate limits
+  req.isApiKeyAuthenticated = false;
+  next();
+}
+
+/**
+ * Rate Limiter & Abuse Filter for Health Check Endpoints
+ * Prevents rapid scraping / polling flood from single IP addresses (60 requests / minute).
+ */
+export function healthRateLimiter(req: Request, res: Response, next: NextFunction): void {
+  if (req.isApiKeyAuthenticated) {
+    return next();
+  }
+
+  pruneStaleRateLimits();
+
+  const ip = getClientIp(req);
+  const now = Date.now();
+  let timestamps = healthRateLimitStore.get(ip) || [];
+  timestamps = timestamps.filter(t => now - t < 60_000);
+
+  if (timestamps.length >= 60) {
+    res.setHeader('Retry-After', '10');
+    res.status(429).json({
+      ok: false,
+      error: 'Too many health check requests. Rate limit is 60 requests per minute per IP.',
+      code: 'RATE_LIMIT_EXCEEDED',
+      retryAfterSeconds: 10,
+    });
+    return;
+  }
+
+  timestamps.push(now);
+  healthRateLimitStore.set(ip, timestamps);
+  next();
+}
+
+/**
+ * Rate Limiter & Abuse Protection for Ping Endpoints
+ * 
+ * Guards against ICMP flood amplification, bot attacks, and resource exhaustion:
+ * - Cross-site origin validation
+ * - Max 4 concurrent in-flight ping executions per IP (allows 'Run All Tests' across 4 regions)
+ * - Max 6 ping executions per rolling 2-minute window per IP
+ */
+export function pingRateLimiter(req: Request, res: Response, next: NextFunction): void {
+  if (req.isApiKeyAuthenticated) {
+    return next();
+  }
+
+  // 1. Anti-abuse cross-site execution check
+  const originCheck = validatePublicRequestOrigin(req);
+  if (!originCheck.allowed) {
+    res.status(403).json({
+      success: false,
+      error: originCheck.reason || 'Forbidden: Cross-site request rejected.',
+      code: 'CROSS_SITE_FORBIDDEN',
+    });
+    return;
+  }
+
+  pruneStaleRateLimits();
+
+  const ip = getClientIp(req);
+  const now = Date.now();
+  let rec = pingRateLimitStore.get(ip);
+  if (!rec) {
+    rec = { timestamps: [], inFlight: 0 };
+    pingRateLimitStore.set(ip, rec);
+  }
+
+  rec.timestamps = rec.timestamps.filter(t => now - t < 120_000);
+
+  // 2. Concurrency limit (max 4 parallel pings per IP)
+  if (rec.inFlight >= 4) {
+    res.setHeader('Retry-After', '5');
+    res.status(429).json({
+      success: false,
+      error: 'Concurrency limit reached: 4 ping tests are already in progress for your IP. Please allow existing tests to finish.',
+      code: 'CONCURRENCY_LIMIT_EXCEEDED',
+      retryAfterSeconds: 5,
+    });
+    return;
+  }
+
+  // 3. Rolling window limit (max 6 requests per 2 minutes)
+  if (rec.timestamps.length >= 6) {
+    const oldest = rec.timestamps[0];
+    const retryAfterSeconds = Math.max(1, Math.ceil((120_000 - (now - oldest)) / 1000));
+    res.setHeader('Retry-After', retryAfterSeconds.toString());
+    res.status(429).json({
+      success: false,
+      error: `Rate limit reached: Maximum 6 ping requests per 2-minute window. Please wait ${retryAfterSeconds}s before starting new tests.`,
+      code: 'RATE_LIMIT_EXCEEDED',
+      retryAfterSeconds,
+    });
+    return;
+  }
+
+  // Record ping slot and track in-flight lifecycle
+  rec.timestamps.push(now);
+  rec.inFlight++;
+
+  let finalized = false;
+  const releaseSlot = () => {
+    if (!finalized) {
+      finalized = true;
+      if (rec) {
+        rec.inFlight = Math.max(0, rec.inFlight - 1);
+      }
+    }
+  };
+
+  res.on('finish', releaseSlot);
+  res.on('close', releaseSlot);
 
   next();
 }
@@ -179,7 +397,7 @@ export function createApiApp(): Application {
    * GET /api/health
    * Central backend health check
    */
-  apiRouter.get('/health', (_req: Request, res: Response) => {
+  apiRouter.get('/health', healthRateLimiter, (_req: Request, res: Response) => {
     res.json({
       status: 'ok',
       service: 'regional-ping-central-backend',
@@ -192,7 +410,7 @@ export function createApiApp(): Application {
    * GET /api/regions
    * Lists supported regional data centers and their backend configuration status
    */
-  apiRouter.get('/regions', (_req: Request, res: Response) => {
+  apiRouter.get('/regions', healthRateLimiter, (_req: Request, res: Response) => {
     const regionsStatus = ALLOWED_REGIONS.reduce((acc, rid) => {
       const url = getRegionalEndpointUrl(rid);
       acc[rid] = {
@@ -215,7 +433,7 @@ export function createApiApp(): Application {
    * GET /api/regions/:regionId/health
    * Proxies health check to the authorized regional agent
    */
-  apiRouter.get('/regions/:regionId/health', async (req: Request, res: Response) => {
+  apiRouter.get('/regions/:regionId/health', healthRateLimiter, async (req: Request, res: Response) => {
     const regionId = req.params.regionId as RegionId;
 
     if (!ALLOWED_REGIONS.includes(regionId)) {
@@ -309,7 +527,7 @@ export function createApiApp(): Application {
    * POST /api/regions/:regionId/ping
    * Executes standardized ping test on the authorized regional server
    */
-  apiRouter.post('/regions/:regionId/ping', async (req: Request, res: Response) => {
+  apiRouter.post('/regions/:regionId/ping', pingRateLimiter, async (req: Request, res: Response) => {
     const regionId = req.params.regionId as RegionId;
 
     // 1. Region validation
