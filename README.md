@@ -14,8 +14,8 @@ A professional, enterprise-grade network connectivity monitoring dashboard for r
   - **LK-DC01**: Sri Lanka Data Center (Colombo)
   - **SG-DC01**: Singapore Regional Hub (Jurong)
 - **Zero Mock / Fake Telemetry**: Unexecuted nodes display neutral "Not Tested" states with dashes (`—`). No fabricated latency or simulated measurements.
-- **Concurrent Regional Testing Architecture**: Ready to dispatch ICMP tests across all 4 regions in parallel with isolated fault handling when regional endpoints are configured.
-- **Clear Unconfigured API Warning**: If regional endpoints are not yet set up, clicking "Run All Ping Tests" alerts the operator to connect authorized regional servers.
+- **Concurrent Regional Testing Architecture**: Dispatches ICMP tests across all 4 regions in parallel with isolated fault handling when regional endpoints are configured.
+- **Clear Unconfigured API Warning**: If regional endpoints are not yet set up, clicking "Run All Ping Tests" alerts the operator with descriptive errors rather than fake data.
 - **Ping Test Results Table**: Searchable, filterable, and sortable by region name, status, and average latency.
 - **Cloud Firestore Persistence**: Genuine completed sessions, aggregate summaries, and individual DC metrics are saved securely under `/pingSessions`.
 - **Test Session History**: Searchable and filterable audit log of historical tests with date and status filters.
@@ -25,165 +25,113 @@ A professional, enterprise-grade network connectivity monitoring dashboard for r
 ## 🛠️ Technology Stack
 
 - **Frontend**: React 19, TypeScript, Vite 8, Tailwind CSS v4, Lucide React icons
-- **Backend / Persistence**: Cloud Firestore (Public Dashboard Mode with schema validation)
-- **Security**: Hardened `firestore.rules` allowing public creation & query with immutable records
-
----
-
-## 📦 Local Installation & Startup
-
-1. **Install dependencies**:
-   ```bash
-   npm install
-   ```
-
-2. **Start the local development server**:
-   ```bash
-   npm run dev
-   ```
-   The application will be accessible at `http://localhost:3000`.
+- **Backend / Serverless**: Express 4, Node.js 22 runtime, Vercel Serverless Functions (`api/index.ts`)
+- **Persistence**: Cloud Firestore (Public Dashboard Mode with schema validation)
+- **Security**: Hardened `firestore.rules`, constant-time token comparison for `CENTRAL_API_KEY`, fixed target `8.8.8.8` enforcement.
 
 ---
 
 ## 🌐 Deploying to Vercel
 
-1. Push your repository to GitHub / GitLab.
-2. Log into [Vercel](https://vercel.com/) and click **Add New > Project**.
-3. Import your repository.
-4. Set the build settings:
-   - **Framework Preset**: Vite
-   - **Build Command**: `npm run build`
-   - **Output Directory**: `dist`
-   - **Install Command**: `npm install`
-5. Under **Environment Variables**, provide your regional API configuration variables (refer to `.env.example`).
-6. Click **Deploy**.
+The application is structured for seamless zero-configuration deployment on **Vercel** as a hybrid static web app with serverless API functions.
 
----
-
-## 📡 Regional Ping API Integration
-
-Real regional ICMP ping tests will be executed by authorized network daemons residing on regional servers in Mumbai, Chennai, Colombo, and Singapore:
-
+### Architecture Overview on Vercel
 ```
-[Browser Client]
-       │
-       ▼ (HTTPS with API Key / Token)
-[Regional API Gateway / Daemon]
-       │ (Input sanitization: regex IPv4 & bounded count)
-       ▼
-[OS Subprocess: ping 8.8.8.8 -n 30]
-       │
-       ▼ (Structured JSON telemetry)
-[Browser UI Dashboard]
+┌────────────────────────────────────────────────────────┐
+│                   Vercel Edge Network                  │
+└───────────────┬────────────────────────┬───────────────┘
+                │                        │
+       Static Assets & SPA        /api/* Routes
+                │                        │
+                ▼                        ▼
+        Vite Build (dist/)      api/index.ts (Serverless)
+        - index.html            - Express API (src/server/app.ts)
+        - JS/CSS bundles        - GET  /api/health
+                                - GET  /api/regions
+                                - GET  /api/regions/:regionId/health
+                                - POST /api/regions/:regionId/ping
 ```
 
-### Security Directives for Regional Endpoints
-1. **Never Allow Raw Shell Execution**: Daemons must use `execFile('ping', [targetIp, '-n', String(count)])` with explicit argument arrays, preventing shell interpolation exploits.
-2. **Strict Regex Validation**: Ensure target IP matches `^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$`.
-3. **Bound Request Range**: Clamp ping count between 1 and 100 packets.
-4. **Rate Limiting**: Enforce a maximum of 10 ping sessions per minute per client.
+### Step-by-Step Vercel Setup
 
-The typed client interface is implemented in `src/services/regionalApi.ts` and can be configured via environment variables.
+1. **Import Repository**:
+   - Push your code to GitHub, GitLab, or Bitbucket.
+   - In Vercel, click **Add New > Project** and import the repository.
 
----
+2. **Build Settings**:
+   - Vercel automatically detects `vercel.json` and Vite:
+     - **Framework Preset**: `Vite`
+     - **Build Command**: `vite build`
+     - **Output Directory**: `dist`
+     - **Install Command**: `npm install`
 
-## 🏛️ Central Backend Architecture & Regional VM Integration
+3. **Configure Environment Variables** (in Vercel Project Settings > Environment Variables):
+   - `REQUIRE_AUTH`: Set to `true` (enforced by default in production).
+   - `CENTRAL_API_KEY`: Secret string for authenticating API requests to `/api/*`.
+   - `REGIONAL_API_KEY`: Optional shared secret forwarded to regional ping daemons.
+   - `REGIONAL_IN_DC02_URL`: URL of the IN-DC02 agent (leave blank until a secure tunnel/gateway is connected).
+   - `REGIONAL_IN_DC01_URL`: URL of the IN-DC01 agent (leave blank until deployed).
+   - `REGIONAL_LK_DC01_URL`: URL of the LK-DC01 agent (leave blank until deployed).
+   - `REGIONAL_SG_DC01_URL`: URL of the SG-DC01 agent (leave blank until deployed).
 
-To keep regional network infrastructure secure and eliminate browser CORS / Mixed Content issues, this application employs a secure full-stack Node.js / Express central proxy backend (`server.ts`).
-
-### 1. File Changes Summary
-* **New Files**:
-  * `server.ts`: Central Express backend providing `/api/health`, `/api/regions`, `/api/regions/:regionId/health`, and `/api/regions/:regionId/ping`. Integrates Vite middleware in dev and serves static production build on Cloud Run.
-* **Modified Files**:
-  * `src/services/regionalApi.ts`: Updated to call same-origin relative `/api/regions/${regionId}/*` routes instead of direct browser-to-agent URLs.
-  * `package.json`: Updated `"dev": "tsx server.ts"` and added `"start": "tsx server.ts"` for containerized deployment.
-  * `tsconfig.json`: Added `"node"` to `compilerOptions.types` to support Node.js and Express APIs in TypeScript.
-  * `.env.example`: Added server-side environment variables for regional agent endpoints and authentication.
-
----
-
-### 2. Required Environment Variables
-Server-side environment variables (never prefix with `VITE_` or expose in client bundles):
-
-| Variable | Description | Default / Example |
-| :--- | :--- | :--- |
-| `PORT` | Listening port for Express / Cloud Run | `3000` (or `8080` in Cloud Run) |
-| `REQUIRE_AUTH` | Enforce auth tokens on `/api/*` routes | `false` (dev) / `true` (prod) |
-| `CENTRAL_API_KEY` | Secret key for central API access | `your-secret-api-key` |
-| `REGIONAL_IN_DC02_URL` | Endpoint for Test-In-dc02 Ubuntu VM | `http://10.202.202.61:8080` |
-| `REGIONAL_IN_DC01_URL` | Endpoint for IN-DC01 | *(Unconfigured by default)* |
-| `REGIONAL_LK_DC01_URL` | Endpoint for LK-DC01 | *(Unconfigured by default)* |
-| `REGIONAL_SG_DC01_URL` | Endpoint for SG-DC01 | *(Unconfigured by default)* |
-| `REGIONAL_API_KEY` | Shared secret forwarded to regional daemons | `your-agent-auth-token` |
+4. **Deploy**:
+   - Trigger deployment via Vercel dashboard or CLI (`vercel --prod`).
 
 ---
 
-### 3. How to Run the App Locally
-```bash
-# 1. Install dependencies
-npm install
+## 🔒 Security & Authentication Directives
 
-# 2. Start the full-stack development server (Express + Vite middleware)
-npm run dev
-```
-Open [http://localhost:3000](http://localhost:3000) in your browser.
-
----
-
-### 4. How to Test the Backend Routes
-You can test the central backend API routes directly using `curl`:
-
-```bash
-# General central health check
-curl http://localhost:3000/api/health
-
-# List supported regions and configuration status
-curl http://localhost:3000/api/regions
-
-# Health check on IN-DC02 (Test-In-dc02)
-curl http://localhost:3000/api/regions/IN-DC02/health
-
-# Health check on unconfigured region (e.g. IN-DC01)
-curl http://localhost:3000/api/regions/IN-DC01/health
-
-# Execute 30 pings to 8.8.8.8 via IN-DC02
-curl -X POST http://localhost:3000/api/regions/IN-DC02/ping \
-  -H "Content-Type: application/json" \
-  -d '{"targetIp": "8.8.8.8", "count": 30}'
-
-# Test security guard: Attempting an arbitrary IP is strictly rejected
-curl -X POST http://localhost:3000/api/regions/IN-DC02/ping \
-  -H "Content-Type: application/json" \
-  -d '{"targetIp": "1.1.1.1", "count": 30}'
-# Response: HTTP 400 Bad Request: Only fixed target 8.8.8.8 is permitted.
-```
+1. **Production Token Verification**:
+   - In production or when `REQUIRE_AUTH=true`, the API enforces constant-time string comparison (`crypto.timingSafeEqual`) against `CENTRAL_API_KEY`.
+   - Requests must provide `Authorization: Bearer <CENTRAL_API_KEY>` or `X-API-Key: <CENTRAL_API_KEY>`.
+   - Arbitrary or generic Bearer tokens are strictly rejected.
+   - If `REQUIRE_AUTH=true` and `CENTRAL_API_KEY` is missing in the environment, the backend responds with HTTP 500 configuration error.
+2. **Fixed Target Enforcement**:
+   - The central backend strictly permits ping tests targeting `8.8.8.8`. Requests attempting to target arbitrary IP addresses are rejected with HTTP 400.
+3. **No Secret Leakage**:
+   - `CENTRAL_API_KEY`, `REGIONAL_API_KEY`, and internal IP configurations are strictly server-side environment variables and are never bundled into client-side `VITE_` variables.
 
 ---
 
-### 5. Why the Private VM (`10.202.202.61`) Cannot Be Reached Directly Without a Network Connection
-* **Private Subnet Isolation**: `10.202.202.61` is an RFC 1918 private IPv4 address residing on the isolated local subnet of the `Test-In-dc02` Ubuntu VM.
-* **No Default Internet Route**: Any machine outside that private network (including development containers or standard Cloud Run environments) cannot route packets to `10.202.202.61` without a private gateway or tunnel.
-* **Safe Degradation**: When connectivity is absent, the central backend fails safely with a clear, sanitized error message (`502 Bad Gateway / Network unreachable`) rather than hanging or crashing.
+## 📡 Private VM Networking Notice (`10.202.202.61`)
+
+- **Why Vercel Cannot Directly Reach `10.202.202.61`**:
+  `10.202.202.61` is an RFC 1918 private IPv4 address on the `Test-In-dc02` Ubuntu VM. Vercel serverless functions execute in dynamic public cloud environments and have no default route into private subnets.
+- **Handling on Vercel**:
+  `REGIONAL_IN_DC02_URL` is intentionally unconfigured by default on Vercel. Attempting to test IN-DC02 returns a clean HTTP 503 error stating that the regional endpoint requires a secure VPC or tunnel connection.
+- **Connecting the Private VM**:
+  To enable Vercel to reach the test VM securely without exposing port 8080 publicly:
+  1. **Tailscale / WireGuard Subnet Router**: Run a Tailscale node on the VM and route traffic via an authorized gateway.
+  2. **Cloudflare Tunnel (cloudflared)**: Run `cloudflared` on the Ubuntu VM to expose an encrypted, authenticated HTTPS hostname (e.g. `https://in-dc02.internal.example.com`) without opening any inbound ports on the firewall.
+  3. **Vercel Secure Compute / VPC Peering**: Connect Vercel to your cloud provider's VPC.
 
 ---
 
-### 6. What Must Be Configured Before Deployment to Cloud Run
-1. **Serverless VPC Access Connector / Direct VPC Egress**:
-   * Attach Cloud Run to the same Google Cloud Virtual Private Cloud (VPC) where `Test-In-dc02` resides.
-   * Enable private VPC routing so Cloud Run can route `10.x.x.x` traffic to the VM.
-2. **VM Firewall Rules**:
-   * On Google Cloud (or on-premise firewall), allow ingress on TCP port `8080` from the VPC connector IP range or Cloud Run subnet only.
-   * Do not open port `8080` to `0.0.0.0/0` (public internet).
-3. **Agent Bind Address**:
-   * Ensure the Python ping daemon on `Test-In-dc02` listens on `0.0.0.0:8080` (or its private network interface), NOT solely on loopback `127.0.0.1:8080`.
-4. **Production Authentication**:
-   * Set `REQUIRE_AUTH=true` and configure `CENTRAL_API_KEY` on Cloud Run.
-   * Set `REGIONAL_API_KEY` to authenticate backend-to-agent requests.
-5. **Container Start Script**:
-   * Ensure `npm start` runs `tsx server.ts` (configured in `package.json`).
+## 💻 Local Development & Testing
+
+1. **Install Dependencies**:
+   ```bash
+   npm install
+   ```
+
+2. **Start Local Full-Stack Server** (Express + Vite Middleware):
+   ```bash
+   npm run dev
+   ```
+   Open `http://localhost:3000` in your browser.
+
+3. **Production Build**:
+   ```bash
+   npm run build
+   ```
+   Generates optimized static assets in `dist/`.
+
+4. **Verify TypeScript & Lint**:
+   ```bash
+   npm run lint
+   ```
 
 ---
 
 ## 📄 License
 Apache-2.0
-
