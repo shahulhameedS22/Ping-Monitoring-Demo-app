@@ -136,7 +136,8 @@ export function getRegionalEndpoints(): Record<RegionId, RegionalEndpointConfig>
     if (globalBase.trim().length > 0) {
       return { url: `${globalBase.replace(/\/+$/, '')}/${defaultPath}`, isCustomized: false };
     }
-    return { url: '', isCustomized: false };
+    // 4. Central backend secure proxy route (same-origin, keeps private IPs and secrets server-side)
+    return { url: `/api/regions/${regionId}`, isCustomized: false };
   };
 
   const inDc01 = resolveUrl('IN-DC01', 'VITE_IN_DC01_API_URL', 'in-dc01');
@@ -250,11 +251,17 @@ export async function testRegionalEndpointConnection(
         serverInfo,
       };
     } else {
+      let message = `Server responded with HTTP ${res.status}: ${res.statusText}`;
+      try {
+        const errorJson = await res.json();
+        if (errorJson.message) message = errorJson.message;
+        else if (errorJson.error) message = errorJson.error;
+      } catch {}
       return {
         ok: false,
         statusCode: res.status,
         latencyMs,
-        message: `Server responded with HTTP ${res.status}: ${res.statusText}`,
+        message,
       };
     }
   } catch (err: any) {
@@ -341,11 +348,16 @@ export async function executeRealRegionalPing(
       try {
         const jsonErr = JSON.parse(errorText);
         if (jsonErr.error) parsedError = jsonErr.error;
+        else if (jsonErr.message) parsedError = jsonErr.message;
       } catch {}
       throw new Error(`Regional server [${req.regionId}] HTTP ${response.status}: ${parsedError || response.statusText}`);
     }
 
     const data: RegionalPingApiResponse = await response.json();
+
+    if (!data.success && data.error) {
+      throw new Error(`Regional server [${req.regionId}]: ${data.error}`);
+    }
 
     // Verify response integrity
     if (typeof data.requestsSent !== 'number' || typeof data.successfulReplies !== 'number') {
