@@ -10,6 +10,9 @@
  * - GET  /api/regions
  * - GET  /api/regions/:regionId/health
  * - POST /api/regions/:regionId/ping
+ * - GET  /api/regions/:regionId/result      (push mode: poll for the agent's result)
+ * - GET  /api/agent/poll                    (push mode: called by regional agents)
+ * - POST /api/agent/ingest                  (push mode: called by regional agents)
  * 
  * Security & Network Hardening:
  * 1. Strict validation: Allowed regions (IN-DC01, IN-DC02, LK-DC01, SG-DC01).
@@ -19,6 +22,7 @@
  * 5. Safe error handling: Sanitized network error messages without stack traces.
  * 6. Hardened Auth: Timing-safe token comparison against CENTRAL_API_KEY in production.
  * 7. Private VM isolation: Never assumes 10.202.202.61 is directly reachable from Vercel.
+ * 8. Push mode: regional agents make OUTBOUND-ONLY HTTPS calls; nothing connects into the VMs.
  */
 
 import express, { type Request, type Response, type NextFunction, type Application } from 'express';
@@ -360,6 +364,321 @@ export function pingRateLimiter(req: Request, res: Response, next: NextFunction)
   next();
 }
 
+/* ======================================================================
+ * PUSH MODE (regional agents make OUTBOUND-ONLY HTTPS calls to this backend)
+ *
+ * Flow (on-demand test):
+ *   1. Browser -> POST /api/regions/:id/ping   -> backend stores a "test requested" flag, returns 202 + requestId
+ *   2. Agent   -> GET  /api/agent/poll         -> sees the flag, runs `ping -c 30 8.8.8.8` ON THE VM
+ *   3. Agent   -> POST /api/agent/ingest       -> pushes the real measured result
+ *   4. Browser -> GET  /api/regions/:id/result -> polls until the result is ready
+ *
+ * A region is in push mode when AGENT_KEY_<REGION> (e.g. AGENT_KEY_IN_DC02) is set.
+ * Regions without that variable keep the previous behaviour (pull mode / 503 unconfigured).
+ * Storage: Upstash Redis REST (UPSTASH_REDIS_REST_URL / _TOKEN, or KV_REST_API_URL / _TOKEN).
+ * ====================================================================== */
+
+const AGENT_STALE_MS = 120_000; // agent is "offline" if no heartbeat for 2 minutes
+const PUSH_REQUEST_TTL_S = 120;
+const PUSH_RESULT_TTL_S = 300;
+const PUSH_COOLDOWN_S = 10;
+const PUSH_SEEN_TTL_S = 600;
+const REQUEST_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+const agentKeyEnvName = (r: RegionId) => `AGENT_KEY_${r.replace(/-/g, '_')}`;
+const PK = {
+  req: (r: string) => `ping:req:${r}`,
+  seen: (r: string) => `ping:seen:${r}`,
+  cool: (r: string) => `ping:cool:${r}`,
+  res: (r: string, id: string) => `ping:res:${r}:${id}`,
+};
+
+export function isPushRegion(regionId: string): regionId is RegionId {
+  return (ALLOWED_REGIONS as readonly string[]).includes(regionId) && Boolean(process.env[agentKeyEnvName(regionId as RegionId)]?.trim());
+}
+
+function digestEqual(a: string, b: string): boolean {
+  const da = crypto.createHash('sha256').update(a).digest();
+  const db = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(da, db);
+}
+
+/** Returns the region whose AGENT_KEY_* matches the Bearer token, or null. The key decides the region. */
+function authAgent(req: Request): RegionId | null {
+  const h = req.headers['authorization'];
+  if (typeof h !== 'string' || !h.startsWith('Bearer ')) return null;
+  const token = h.substring(7).trim();
+  if (!token) return null;
+  let found: RegionId | null = null;
+  for (const r of ALLOWED_REGIONS) {
+    const key = process.env[agentKeyEnvName(r)]?.trim();
+    if (key && digestEqual(token, key)) found = r;
+  }
+  return found;
+}
+
+/** Small per-IP limiter (in-memory, best-effort on serverless). */
+function pushIpLimiter(maxPerMinute: number) {
+  const hits = new Map<string, number[]>();
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (req.isApiKeyAuthenticated) return next();
+    const now = Date.now();
+    const ip = getClientIp(req);
+    const fresh = (hits.get(ip) || []).filter((t) => now - t < 60_000);
+    if (fresh.length >= maxPerMinute) {
+      res.setHeader('Retry-After', '10');
+      res.status(429).json({ ok: false, error: 'Too many requests. Please slow down.', code: 'RATE_LIMIT_EXCEEDED' });
+      return;
+    }
+    fresh.push(now);
+    hits.set(ip, fresh);
+    if (hits.size > 5000) hits.clear();
+    next();
+  };
+}
+
+type RedisCmd = (string | number)[];
+
+function redisConfig(): { url: string; token: string } | null {
+  const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+  return url && token ? { url: url.replace(/\/+$/, ''), token } : null;
+}
+
+async function redisPipeline(cmds: RedisCmd[]): Promise<any[]> {
+  const cfg = redisConfig();
+  if (!cfg) throw new Error('STORAGE_NOT_CONFIGURED');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const r = await fetch(`${cfg.url}/pipeline`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${cfg.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(cmds),
+      signal: controller.signal,
+    });
+    if (!r.ok) throw new Error(`Storage HTTP ${r.status}`);
+    const arr = (await r.json()) as Array<{ result?: any; error?: string }>;
+    return arr.map((x) => {
+      if (x.error) throw new Error(x.error);
+      return x.result;
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function pushStorageError(res: Response, err: any, extra: Record<string, unknown> = {}) {
+  console.error('[push-mode] storage error:', err?.message || err);
+  const notConfigured = err?.message === 'STORAGE_NOT_CONFIGURED';
+  res.status(503).json({
+    ok: false,
+    success: false,
+    ...extra,
+    error: notConfigured
+      ? 'Result storage is not configured on the central backend (Upstash Redis environment variables missing).'
+      : 'Result storage is temporarily unavailable.',
+  });
+}
+
+async function agentPoll(req: Request, res: Response) {
+  const region = authAgent(req);
+  if (!region) return void res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const cmds: RedisCmd[] = [['GET', PK.req(region)]];
+    if (req.header('x-heartbeat') === '1') cmds.push(['SET', PK.seen(region), String(Date.now()), 'EX', PUSH_SEEN_TTL_S]);
+    const out = await redisPipeline(cmds);
+    const raw = out[0];
+    if (!raw) return void res.json({ pending: false });
+    const rec = JSON.parse(raw);
+    if (rec.status !== 'pending') return void res.json({ pending: false });
+    await redisPipeline([
+      ['SET', PK.req(region), JSON.stringify({ ...rec, status: 'running', startedAt: Date.now() }), 'EX', PUSH_REQUEST_TTL_S],
+      ['SET', PK.seen(region), String(Date.now()), 'EX', PUSH_SEEN_TTL_S],
+    ]);
+    res.json({ pending: true, requestId: rec.requestId, count: rec.count });
+  } catch (err) {
+    pushStorageError(res, err);
+  }
+}
+
+const isNum = (v: unknown, min: number, max: number): v is number =>
+  typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max;
+const numOrNull = (v: unknown) => v === null || isNum(v, 0, 60_000);
+
+/** Whitelist + range-check everything an agent sends. Returns sanitized result or an error string. */
+function sanitizeAgentResult(body: any, region: RegionId): { ok: true; result: any } | { ok: false; error: string } {
+  if (!body || typeof body !== 'object') return { ok: false, error: 'Body must be a JSON object.' };
+  if (body.targetIp !== FIXED_TARGET_IP) return { ok: false, error: `targetIp must be ${FIXED_TARGET_IP}.` };
+  if (!Number.isInteger(body.requestsSent) || body.requestsSent < 1 || body.requestsSent > MAX_PING_COUNT)
+    return { ok: false, error: 'requestsSent must be an integer 1-30.' };
+  if (!Number.isInteger(body.successfulReplies) || body.successfulReplies < 0 || body.successfulReplies > body.requestsSent)
+    return { ok: false, error: 'successfulReplies must be an integer 0..requestsSent.' };
+  for (const f of ['minLatencyMs', 'avgLatencyMs', 'maxLatencyMs', 'jitterMs']) {
+    if (!numOrNull(body[f])) return { ok: false, error: `${f} must be null or a number 0-60000.` };
+  }
+  if (!isNum(body.executionDurationMs, 0, 300_000)) return { ok: false, error: 'executionDurationMs out of range.' };
+  if (!Array.isArray(body.packets) || body.packets.length > MAX_PING_COUNT) return { ok: false, error: 'packets must be an array (max 30).' };
+  const packets = [];
+  for (const p of body.packets) {
+    if (!p || !Number.isInteger(p.sequence) || p.sequence < 1 || p.sequence > 1000 || typeof p.success !== 'boolean' || !numOrNull(p.latencyMs ?? null))
+      return { ok: false, error: 'Invalid packet entry.' };
+    packets.push({
+      sequence: p.sequence,
+      latencyMs: p.latencyMs ?? null,
+      ...(Number.isInteger(p.ttl) && p.ttl >= 0 && p.ttl <= 255 ? { ttl: p.ttl } : {}),
+      success: p.success,
+    });
+  }
+  const sent = body.requestsSent as number;
+  const okCount = body.successfulReplies as number;
+  const failed = sent - okCount;
+  return {
+    ok: true,
+    result: {
+      success: body.success === true,
+      regionId: region, // decided by the agent's key, never by the body
+      targetIp: FIXED_TARGET_IP,
+      requestsSent: sent,
+      successfulReplies: okCount,
+      failedRequests: failed,
+      packetLossPercent: Math.round((failed / sent) * 1000) / 10,
+      minLatencyMs: body.minLatencyMs,
+      avgLatencyMs: body.avgLatencyMs,
+      maxLatencyMs: body.maxLatencyMs,
+      jitterMs: body.jitterMs,
+      packets,
+      executionDurationMs: body.executionDurationMs,
+      timestamp: new Date().toISOString(), // server time
+      serverVersion: 'push-agent',
+      ...(typeof body.error === 'string' && body.error ? { error: body.error.slice(0, 200) } : {}),
+    },
+  };
+}
+
+async function agentIngest(req: Request, res: Response) {
+  const region = authAgent(req);
+  if (!region) return void res.status(401).json({ error: 'Unauthorized' });
+  const requestId = req.body?.requestId;
+  if (typeof requestId !== 'string' || !REQUEST_ID_RE.test(requestId))
+    return void res.status(400).json({ error: 'Valid requestId is required.' });
+  const clean = sanitizeAgentResult(req.body, region);
+  if (!clean.ok) return void res.status(400).json({ error: clean.error });
+  try {
+    const [raw] = await redisPipeline([['GET', PK.req(region)]]);
+    const rec = raw ? JSON.parse(raw) : null;
+    if (!rec || rec.requestId !== requestId)
+      return void res.status(409).json({ error: 'No matching pending test request (expired or already completed).' });
+    await redisPipeline([
+      ['SET', PK.res(region, requestId), JSON.stringify(clean.result), 'EX', PUSH_RESULT_TTL_S],
+      ['DEL', PK.req(region)],
+      ['SET', PK.cool(region), '1', 'EX', PUSH_COOLDOWN_S],
+      ['SET', PK.seen(region), String(Date.now()), 'EX', PUSH_SEEN_TTL_S],
+    ]);
+    res.json({ ok: true });
+  } catch (err) {
+    pushStorageError(res, err);
+  }
+}
+
+async function pushHealth(req: Request, res: Response, next: NextFunction) {
+  const regionId = String(req.params.regionId);
+  if (!isPushRegion(regionId)) return next();
+  try {
+    const [seen] = await redisPipeline([['GET', PK.seen(regionId)]]);
+    const ageMs = seen ? Date.now() - Number(seen) : Infinity;
+    if (ageMs <= AGENT_STALE_MS) {
+      return void res.json({
+        ok: true, statusCode: 200, status: 'online', regionId, latencyMs: 0,
+        message: `Regional agent online (last heartbeat ${Math.round(ageMs / 1000)}s ago)`,
+        serverInfo: { mode: 'push' },
+      });
+    }
+    res.status(503).json({
+      ok: false, statusCode: 503, status: 'offline', regionId,
+      message: `Regional agent for ${regionId} is offline: no heartbeat received in the last 2 minutes.`,
+    });
+  } catch (err) {
+    pushStorageError(res, err, { statusCode: 503, regionId });
+  }
+}
+
+async function pushPing(req: Request, res: Response, next: NextFunction) {
+  const regionId = String(req.params.regionId);
+  if (!isPushRegion(regionId)) return next();
+
+  if (!req.isApiKeyAuthenticated && req.headers['sec-fetch-site'] === 'cross-site')
+    return void res.status(403).json({ success: false, error: 'Cross-site request rejected.', code: 'CROSS_SITE_FORBIDDEN' });
+
+  const targetIp = (req.body?.targetIp || FIXED_TARGET_IP).toString().trim();
+  if (targetIp !== FIXED_TARGET_IP)
+    return void res.status(400).json({ success: false, regionId, error: `Forbidden target IP: "${targetIp}". Only ${FIXED_TARGET_IP} is permitted.` });
+
+  let count = DEFAULT_PING_COUNT;
+  if (req.body?.count !== undefined) {
+    const n = Number(req.body.count);
+    if (!Number.isInteger(n) || n < MIN_PING_COUNT || n > MAX_PING_COUNT)
+      return void res.status(400).json({ success: false, regionId, error: 'Invalid ping count. Must be an integer between 1 and 30.' });
+    count = n;
+  }
+
+  try {
+    const [seen, pending, cool] = await redisPipeline([['GET', PK.seen(regionId)], ['GET', PK.req(regionId)], ['EXISTS', PK.cool(regionId)]]);
+    if (!seen || Date.now() - Number(seen) > AGENT_STALE_MS)
+      return void res.status(503).json({ success: false, regionId, error: `Regional agent for ${regionId} is offline: no heartbeat in the last 2 minutes.` });
+
+    if (pending) {
+      // a test is already queued/running for this region: everyone shares it
+      const rec = JSON.parse(pending);
+      return void res.status(202).json({ status: 'queued', requestId: rec.requestId, regionId, pollAfterMs: 3000 });
+    }
+    if (Number(cool) > 0) {
+      res.setHeader('Retry-After', String(PUSH_COOLDOWN_S));
+      return void res.status(429).json({ success: false, regionId, error: `A test for ${regionId} just finished. Please wait ${PUSH_COOLDOWN_S}s before starting another.` });
+    }
+
+    const requestId = crypto.randomUUID();
+    await redisPipeline([['SET', PK.req(regionId), JSON.stringify({ requestId, status: 'pending', count, createdAt: Date.now() }), 'EX', PUSH_REQUEST_TTL_S]]);
+    res.status(202).json({ status: 'queued', requestId, regionId, pollAfterMs: 3000 });
+  } catch (err) {
+    pushStorageError(res, err, { regionId });
+  }
+}
+
+async function pushResult(req: Request, res: Response, next: NextFunction) {
+  const regionId = String(req.params.regionId);
+  if (!isPushRegion(regionId)) return next();
+  const requestId = String(req.query.requestId || '');
+  if (!REQUEST_ID_RE.test(requestId)) return void res.status(400).json({ status: 'error', error: 'Invalid requestId.' });
+  try {
+    const [done, pending] = await redisPipeline([['GET', PK.res(regionId, requestId)], ['GET', PK.req(regionId)]]);
+    if (done) return void res.json({ status: 'done', result: JSON.parse(done) });
+    const rec = pending ? JSON.parse(pending) : null;
+    if (rec && rec.requestId === requestId) return void res.status(202).json({ status: rec.status });
+    res.status(404).json({ status: 'expired', error: 'Result not found or expired. Please run the test again.' });
+  } catch (err) {
+    pushStorageError(res, err, { status: 'error' });
+  }
+}
+
+/**
+ * Registered once in createApiApp(), right after `apiRouter.use(authMiddleware)`.
+ * Agent routes are mounted on the app BEFORE the main router so agent keys are never
+ * checked against CENTRAL_API_KEY. The browser-facing routes are added to the router
+ * first, and call next() for regions that are not in push mode.
+ */
+function registerPushMode(app: Application, apiRouter: express.Router): void {
+  const agentRouter = express.Router();
+  agentRouter.get('/poll', pushIpLimiter(120), agentPoll);
+  agentRouter.post('/ingest', pushIpLimiter(60), agentIngest);
+  app.use('/api/agent', agentRouter);
+  app.use('/agent', agentRouter);
+
+  apiRouter.get('/regions/:regionId/health', pushIpLimiter(60), pushHealth);
+  apiRouter.post('/regions/:regionId/ping', pushIpLimiter(20), pushPing);
+  apiRouter.get('/regions/:regionId/result', pushIpLimiter(300), pushResult);
+}
+
 /**
  * Creates and configures the Express application
  */
@@ -379,6 +698,9 @@ export function createApiApp(): Application {
 
   const apiRouter = express.Router();
   apiRouter.use(authMiddleware);
+
+  // Push mode: regional agents push real ping results outbound-only (see section above)
+  registerPushMode(app, apiRouter);
 
   /**
    * Root / Info route for API
@@ -402,7 +724,7 @@ export function createApiApp(): Application {
       status: 'ok',
       service: 'regional-ping-central-backend',
       timestamp: new Date().toISOString(),
-      configuredRegions: ALLOWED_REGIONS.filter(r => Boolean(getRegionalEndpointUrl(r))),
+      configuredRegions: ALLOWED_REGIONS.filter(r => Boolean(getRegionalEndpointUrl(r)) || isPushRegion(r)),
     });
   });
 
@@ -415,7 +737,7 @@ export function createApiApp(): Application {
       const url = getRegionalEndpointUrl(rid);
       acc[rid] = {
         regionId: rid,
-        isConfigured: Boolean(url),
+        isConfigured: Boolean(url) || isPushRegion(rid),
         // Security note: Do not expose private IPs or full URLs to browser clients
         description: rid === 'IN-DC02' ? 'Test-In-dc02 Ubuntu Agent' : 'Regional Data Center Node',
       };
