@@ -291,7 +291,7 @@ export async function testRegionalEndpointConnection(
  *   its real measurement, then returns that result.
  */
 const PUSH_POLL_EVERY_MS = 3000;
-const PUSH_MAX_WAIT_MS = 75_000; // ~5s agent pickup + ~30s ping + margin
+const PUSH_MAX_WAIT_MS = 90_000; // up to ~30s agent pickup + ~30s ping + margin
 
 async function readPingResponse(response: Response, baseUrl: string, regionId: string): Promise<any> {
   const first = await response.json();
