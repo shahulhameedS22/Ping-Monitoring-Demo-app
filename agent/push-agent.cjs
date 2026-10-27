@@ -5,19 +5,19 @@
  * Runs ON the regional VM. Makes OUTBOUND HTTPS calls only; listens on no port.
  *  - polls the central app every POLL_INTERVAL_SEC for a "test requested" flag
  *  - when asked, runs a REAL `ping -c <n> 8.8.8.8` on this VM and pushes the result
- *  - sends a heartbeat about once a minute so the dashboard can show "online/offline"
+ *  - sends a heartbeat about every 5 minutes so the dashboard can show "online/offline"
  *
  * Env:
  *   AGENT_URL   e.g. https://ping-monitoring-demo-app.vercel.app   (required)
  *   AGENT_KEY   this region's secret key (AGENT_KEY_IN_DC02 value in Vercel) (required)
- *   POLL_INTERVAL_SEC  default 10 (min 2)
+ *   POLL_INTERVAL_SEC  default 30 (min 2)
  */
 'use strict';
 const { execFile } = require('node:child_process');
 
 const TARGET = '8.8.8.8'; // fixed on purpose; never taken from the server
 const MAX_COUNT = 30;
-const HEARTBEAT_EVERY_MS = 60_000;
+const HEARTBEAT_EVERY_MS = 300_000; // 5 minutes (keeps Upstash usage inside the free plan)
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -127,7 +127,7 @@ async function pushResult(base, key, requestId, result) {
 async function main() {
   const base = (process.env.AGENT_URL || '').replace(/\/+$/, '');
   const key = (process.env.AGENT_KEY || '').trim();
-  const pollMs = Math.max(2, Number(process.env.POLL_INTERVAL_SEC) || 10) * 1000;
+  const pollMs = Math.max(2, Number(process.env.POLL_INTERVAL_SEC) || 30) * 1000;
   if (!/^https:\/\//.test(base) && !/^http:\/\/(localhost|127\.0\.0\.1)/.test(base)) {
     console.error('AGENT_URL must be an https:// URL (e.g. https://ping-monitoring-demo-app.vercel.app)');
     process.exit(1);
