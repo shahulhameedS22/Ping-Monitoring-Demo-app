@@ -13,6 +13,7 @@
  */
 
 import { type RegionId, type RegionPingResult, type PingPacket, REGIONS } from '../types/ping';
+import { publishPingAlert } from './alertCenter';
 
 const STORAGE_KEY = 'regional_ping_endpoints_v1';
 
@@ -68,6 +69,14 @@ export interface RegionalPingApiResponse {
   timestamp: string;
   serverVersion?: string;
   error?: string;
+  /** Added by the central backend (push mode): timeout alert details */
+  alert?: {
+    level: 'none' | 'warning' | 'critical';
+    timeouts: number;
+    maxConsecutiveTimeouts: number;
+    threshold: number;
+    emailStatus: 'not_required' | 'sent' | 'skipped_cooldown' | 'not_configured' | 'failed';
+  };
 }
 
 /**
@@ -285,6 +294,44 @@ export async function testRegionalEndpointConnection(
 }
 
 /**
+ * Shows an in-app alert when a result contains at least one timed-out ping request.
+ */
+function emitTimeoutAlert(data: RegionalPingApiResponse, regionId: RegionId): void {
+  try {
+    const packets = Array.isArray(data.packets) ? data.packets : [];
+    const sent = typeof data.requestsSent === 'number' ? data.requestsSent : packets.length;
+    let timeouts = packets.filter((p) => !p.success).length;
+    if (timeouts === 0 && typeof data.failedRequests === 'number') timeouts = data.failedRequests;
+    if (timeouts <= 0) return;
+
+    let run = 0;
+    let maxRun = 0;
+    for (const p of [...packets].sort((a, b) => a.sequence - b.sequence)) {
+      if (!p.success) {
+        run += 1;
+        if (run > maxRun) maxRun = run;
+      } else {
+        run = 0;
+      }
+    }
+    if (packets.length === 0) maxRun = data.alert?.maxConsecutiveTimeouts ?? (timeouts >= sent ? sent : 1);
+
+    publishPingAlert({
+      regionId,
+      timeouts,
+      total: sent,
+      maxConsecutive: maxRun,
+      packetLossPercent: typeof data.packetLossPercent === 'number' ? data.packetLossPercent : undefined,
+      level: data.alert?.level === 'warning' || data.alert?.level === 'critical' ? data.alert.level : undefined,
+      threshold: data.alert?.threshold,
+      emailStatus: data.alert?.emailStatus,
+    });
+  } catch {
+    /* alerts must never break a test result */
+  }
+}
+
+/**
  * Push mode helper.
  * - HTTP 200 with a full result (older pull mode) is returned unchanged.
  * - HTTP 202 + requestId: polls GET <base>/result until the regional agent has pushed
@@ -383,6 +430,9 @@ export async function executeRealRegionalPing(
     }
 
     const data: RegionalPingApiResponse = await readPingResponse(response, cleanBase, req.regionId);
+
+    // Alert on ANY timed-out ping request (the email is sent by the backend only for long runs)
+    emitTimeoutAlert(data, req.regionId);
 
     if (!data.success && data.error) {
       throw new Error(`Regional server [${req.regionId}]: ${data.error}`);
