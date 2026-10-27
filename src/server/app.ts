@@ -378,11 +378,11 @@ export function pingRateLimiter(req: Request, res: Response, next: NextFunction)
  * Storage: Upstash Redis REST (UPSTASH_REDIS_REST_URL / _TOKEN, or KV_REST_API_URL / _TOKEN).
  * ====================================================================== */
 
-const AGENT_STALE_MS = 120_000; // agent is "offline" if no heartbeat for 2 minutes
+const AGENT_STALE_MS = 600_000; // agent is "offline" if no heartbeat for 10 minutes (heartbeat is sent every 5 minutes)
 const PUSH_REQUEST_TTL_S = 120;
 const PUSH_RESULT_TTL_S = 300;
 const PUSH_COOLDOWN_S = 10;
-const PUSH_SEEN_TTL_S = 600;
+const PUSH_SEEN_TTL_S = 1200;
 const REQUEST_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 const agentKeyEnvName = (r: RegionId) => `AGENT_KEY_${r.replace(/-/g, '_')}`;
@@ -596,7 +596,7 @@ async function pushHealth(req: Request, res: Response, next: NextFunction) {
     }
     res.status(503).json({
       ok: false, statusCode: 503, status: 'offline', regionId,
-      message: `Regional agent for ${regionId} is offline: no heartbeat received in the last 2 minutes.`,
+      message: `Regional agent for ${regionId} is offline: no heartbeat received in the last 10 minutes.`,
     });
   } catch (err) {
     pushStorageError(res, err, { statusCode: 503, regionId });
@@ -625,7 +625,7 @@ async function pushPing(req: Request, res: Response, next: NextFunction) {
   try {
     const [seen, pending, cool] = await redisPipeline([['GET', PK.seen(regionId)], ['GET', PK.req(regionId)], ['EXISTS', PK.cool(regionId)]]);
     if (!seen || Date.now() - Number(seen) > AGENT_STALE_MS)
-      return void res.status(503).json({ success: false, regionId, error: `Regional agent for ${regionId} is offline: no heartbeat in the last 2 minutes.` });
+      return void res.status(503).json({ success: false, regionId, error: `Regional agent for ${regionId} is offline: no heartbeat in the last 10 minutes.` });
 
     if (pending) {
       // a test is already queued/running for this region: everyone shares it
