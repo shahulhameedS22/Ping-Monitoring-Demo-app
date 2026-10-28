@@ -807,9 +807,7 @@ async function agentIngest(req: Request, res: Response) {
   if (typeof requestId !== 'string' || !REQUEST_ID_RE.test(requestId))
     return void res.status(400).json({ error: 'Valid requestId is required.' });
   const clean = sanitizeAgentResult(req.body, region);
-  if (clean.ok === false) {
-    return void res.status(400).json({ error: clean.error });
-  }
+  if (!clean.ok) return void res.status(400).json({ error: clean.error });
   try {
     const [raw] = await redisPipeline([['GET', PK.req(region)]]);
     const rec = raw ? JSON.parse(raw) : null;
