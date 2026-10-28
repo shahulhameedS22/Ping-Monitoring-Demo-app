@@ -1,0 +1,38 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net - Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    // Ping session validation for public monitoring dashboard
+    function isValidPingSession(data) {
+      return data.keys().hasAll(['id', 'targetIp', 'pingCount', 'status', 'isSimulated', 'startedAt', 'summary', 'regions'])
+        && data.id is string && data.id.size() <= 128
+        && data.targetIp is string && data.targetIp.size() <= 64
+        && data.pingCount is number && data.pingCount >= 1 && data.pingCount <= 1000
+        && data.status in ['running', 'success', 'partial_loss', 'failed']
+        && data.isSimulated is bool
+        && data.startedAt is string && data.startedAt.size() <= 64
+        && data.summary is map
+        && data.regions is map;
+    }
+
+    // Public Ping Sessions Collection (Read & Create allowed with strict validation; updates/deletions locked)
+    match /pingSessions/{sessionId} {
+      allow get, list: if true;
+      allow create: if isValidId(sessionId) && isValidPingSession(incoming());
+      allow update, delete: if false;
+    }
+  }
+}
